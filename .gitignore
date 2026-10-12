@@ -1,0 +1,23 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+
+# Archivos generados por Python
+__pycache__/
+*.py[cod]
+
+# Caché y cobertura de pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Artefactos de empaquetado
+build/
+dist/
+*.egg-info/
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
