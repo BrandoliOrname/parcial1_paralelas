@@ -351,31 +351,35 @@ def simulate_mpi(
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Simulación MPI del Juego de la Vida")
+    parser.add_argument("--rows", type=int, default=10, help="Número de filas")
+    parser.add_argument("--cols", type=int, default=10, help="Número de columnas")
+    parser.add_argument("--generations", type=int, default=5, help="Número de generaciones")
+    parser.add_argument("--seed", type=int, default=42, help="Semilla aleatoria")
+    parser.add_argument("--quiet", action="store_true", help="No imprimir matrices en consola")
+    args = parser.parse_args()
 
     comm = MPI.COMM_WORLD
 
     rank = comm.Get_rank()
     size = comm.Get_size()
 
-    ROWS = 10
-    COLS = 10
-    GENERATIONS = 5
-
     # ======================================================
     # SOLO RANK 0 CREA EL ESTADO GLOBAL INICIAL
     # ======================================================
 
     if rank == 0:
-
         grid = random_grid(
-            rows=ROWS,
-            cols=COLS,
+            rows=args.rows,
+            cols=args.cols,
             density=0.3,
-            seed=42
+            seed=args.seed
         )
-
-        print("Generación inicial:")
-        print(grid)
+        if not args.quiet:
+            print("Generación inicial:")
+            print(grid)
 
     else:
         grid = None
@@ -386,7 +390,7 @@ if __name__ == "__main__":
 
     final_grid = simulate_mpi(
         initial_grid=grid,
-        generations=GENERATIONS,
+        generations=args.generations,
         comm=comm
     )
 
@@ -394,11 +398,9 @@ if __name__ == "__main__":
     # SOLO RANK 0 VUELVE A TENER LA MATRIZ COMPLETA
     # ======================================================
 
-    if rank == 0:
-
+    if rank == 0 and not args.quiet:
         print(
             f"\nGeneración final "
-            f"después de {GENERATIONS} generaciones:"
+            f"después de {args.generations} generaciones:"
         )
-
         print(final_grid)
