@@ -23,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.core.grid import random_grid, empty_grid
 from src.core.secuencial import next_generation_loops, next_generation_numpy
+from src.core.mpi_bridge import MPIWorkerManager
 
 # ==========================================
 # CONSTANTES DE ESTILO Y COLORES (Dark Modern)
@@ -122,6 +123,14 @@ class GameOfLifeApp:
         self.num_processes = 4
         self.target_fps = 30
 
+        # Administrador del clúster de procesos MPI
+        self.mpi_manager = MPIWorkerManager()
+
+        # Control de edición interactiva del ratón
+        self.grid_dirty = False
+        self.draw_paint_val = 1
+        self.last_edited_cell: tuple[int, int] | None = None
+
         # Botones e interfaz
         self.buttons = []
         self._init_ui()
@@ -203,14 +212,32 @@ class GameOfLifeApp:
         self.btn_play.color = (50, 40, 20) if self.running_simulation else CARD_BG
 
     def step_generation(self):
+        # Si se dibujó con el mouse mientras estaba pausado, sincronizar con MPI antes del paso
+        if self.grid_dirty:
+            if self.engine_mode == "parallel" and self.mpi_manager.is_running():
+                self.mpi_manager.set_grid(self.grid)
+            self.grid_dirty = False
+
         t0 = time.perf_counter()
         if self.engine_mode == "loops":
             self.grid = next_generation_loops(self.grid)
         elif self.engine_mode == "numpy":
             self.grid = next_generation_numpy(self.grid)
         elif self.engine_mode == "parallel":
-            # En la interfaz gráfica interactiva se evoluciona la matriz de forma visual
-            self.grid = next_generation_numpy(self.grid)
+            # Iniciar el worker MPI persistente si aún no está activo
+            if not self.mpi_manager.is_running():
+                started = self.mpi_manager.start(self.num_processes, self.grid)
+                if not started:
+                    # Fallback suave en caso de que MPI no esté instalado o falle
+                    self.grid = next_generation_numpy(self.grid)
+
+            if self.mpi_manager.is_running():
+                new_grid, _ = self.mpi_manager.step()
+                if new_grid is not None:
+                    self.grid = new_grid
+                else:
+                    self.grid = next_generation_numpy(self.grid)
+
         t1 = time.perf_counter()
         self.last_step_time_ms = (t1 - t0) * 1000
         self.generation += 1
@@ -219,32 +246,50 @@ class GameOfLifeApp:
         self.grid = random_grid(self.grid_size, self.grid_size, density=0.25)
         self.generation = 0
         self.last_step_time_ms = 0.0
+        self.grid_dirty = False
+        if self.engine_mode == "parallel" and self.mpi_manager.is_running():
+            self.mpi_manager.set_grid(self.grid)
 
     def clear_grid(self):
         self.grid = empty_grid(self.grid_size, self.grid_size)
         self.generation = 0
         self.last_step_time_ms = 0.0
+        self.grid_dirty = False
+        if self.engine_mode == "parallel" and self.mpi_manager.is_running():
+            self.mpi_manager.set_grid(self.grid)
 
     def set_grid_size(self, size):
         if self.grid_size != size:
             self.grid_size = size
+            if self.engine_mode == "parallel":
+                self.mpi_manager.stop()
             self.reset_grid()
+            if self.engine_mode == "parallel":
+                self.mpi_manager.start(self.num_processes, self.grid)
             self._init_ui()
 
     def set_engine_mode(self, mode):
-        self.engine_mode = mode
-        self._init_ui()
+        if self.engine_mode != mode:
+            if mode == "parallel":
+                self.mpi_manager.start(self.num_processes, self.grid)
+            else:
+                self.mpi_manager.stop()
+            self.engine_mode = mode
+            self._init_ui()
 
     def set_num_processes(self, procs):
-        self.num_processes = procs
-        self._init_ui()
+        if self.num_processes != procs:
+            self.num_processes = procs
+            if self.engine_mode == "parallel":
+                self.mpi_manager.start(self.num_processes, self.grid)
+            self._init_ui()
 
     def set_fps(self, fps):
         self.target_fps = fps
         self._init_ui()
 
-    def handle_mouse_cell_edit(self, pos):
-        """Permite al usuario dibujar/eliminar células en la matriz con el mouse."""
+    def handle_mouse_cell_edit(self, pos, is_click=False):
+        """Permite al usuario dibujar/eliminar células en la matriz con el mouse de forma fluida."""
         mx, my = pos
         if 20 <= mx < 20 + GRID_VIEW_SIZE and 20 <= my < 20 + GRID_VIEW_SIZE:
             rel_x = mx - 20
@@ -252,7 +297,15 @@ class GameOfLifeApp:
             c = int(rel_x / GRID_VIEW_SIZE * self.grid_size)
             r = int(rel_y / GRID_VIEW_SIZE * self.grid_size)
             if 0 <= r < self.grid_size and 0 <= c < self.grid_size:
-                self.grid[r, c] = 0 if self.grid[r, c] == 1 else 1
+                if is_click:
+                    self.draw_paint_val = 0 if self.grid[r, c] == 1 else 1
+                    self.grid[r, c] = self.draw_paint_val
+                    self.last_edited_cell = (r, c)
+                    self.grid_dirty = True
+                elif (r, c) != self.last_edited_cell:
+                    self.grid[r, c] = self.draw_paint_val
+                    self.last_edited_cell = (r, c)
+                    self.grid_dirty = True
 
     def render_grid_surface(self) -> pygame.Surface:
         """Renderizado ultra optimizado usando surfarray y escala por hardware."""
@@ -302,10 +355,14 @@ class GameOfLifeApp:
         self.screen.blit(self.font_small.render("ESTADO SIMULACIÓN", True, TEXT_SECONDARY), (panel_x + 12, 78))
         self.screen.blit(self.font_bold.render(status_txt, True, status_color), (panel_x + 12, 94))
 
+        # Indicador de motor activo
+        engine_label = "Loops (Sec.)" if self.engine_mode == "loops" else ("NumPy (Sec.)" if self.engine_mode == "numpy" else f"MPI ({self.num_processes}P)")
+        self.screen.blit(self.font_small.render(f"Motor: {engine_label}", True, ACCENT_BLUE if self.engine_mode == "parallel" else TEXT_SECONDARY), (panel_x + 12, 114))
+        self.screen.blit(self.font_small.render(f"Velocidad: {self.clock.get_fps():.1f} t/s", True, TEXT_SECONDARY), (panel_x + 12, 132))
+
         self.screen.blit(self.font_small.render(f"Generación: {self.generation}", True, TEXT_PRIMARY), (panel_x + 160, 78))
         self.screen.blit(self.font_small.render(f"Células Vivas: {alive_count:,} ({alive_pct:.1f}%)", True, TEXT_PRIMARY), (panel_x + 160, 96))
         self.screen.blit(self.font_small.render(f"Paso actual: {self.last_step_time_ms:.2f} ms", True, ACCENT_BLUE), (panel_x + 160, 114))
-        self.screen.blit(self.font_small.render(f"Velocidad: {self.clock.get_fps():.1f} ticks/s", True, TEXT_SECONDARY), (panel_x + 12, 128))
 
         # Títulos de Secciones
         self.screen.blit(self.font_bold.render("Tamaño de la Matriz:", True, TEXT_PRIMARY), (panel_x, 230))
@@ -367,17 +424,22 @@ class GameOfLifeApp:
                     if event.button == 1:
                         mouse_pressed = True
                         if not any(b.handle_event(event) for b in self.buttons):
-                            self.handle_mouse_cell_edit(event.pos)
+                            self.handle_mouse_cell_edit(event.pos, is_click=True)
 
                 elif event.type == pygame.MOUSEBUTTONUP:
                     if event.button == 1:
                         mouse_pressed = False
+                        self.last_edited_cell = None
+                        if self.grid_dirty:
+                            if self.engine_mode == "parallel" and self.mpi_manager.is_running():
+                                self.mpi_manager.set_grid(self.grid)
+                            self.grid_dirty = False
 
                 elif event.type == pygame.MOUSEMOTION:
                     for b in self.buttons:
                         b.handle_event(event)
                     if mouse_pressed and not self.running_simulation:
-                        self.handle_mouse_cell_edit(event.pos)
+                        self.handle_mouse_cell_edit(event.pos, is_click=False)
 
             # Si la simulación está activa, avanzar generación
             if self.running_simulation:
@@ -397,6 +459,7 @@ class GameOfLifeApp:
             pygame.display.flip()
             self.clock.tick(self.target_fps)
 
+        self.mpi_manager.stop()
         pygame.quit()
 
 

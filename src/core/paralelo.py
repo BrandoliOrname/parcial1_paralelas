@@ -1,3 +1,10 @@
+import os
+import mpi4py
+
+# Evitar que mpi4py llame a MPI_Init fuera de un entorno mpirun (evita bloqueos de PMIX en pytest o imports)
+if "OMPI_COMM_WORLD_RANK" not in os.environ and "PMIX_RANK" not in os.environ:
+    mpi4py.rc.initialize = False
+
 from mpi4py import MPI
 import numpy as np
 
